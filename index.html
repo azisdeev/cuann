@@ -259,14 +259,14 @@
       <div class="card">
         <h3>ECONOMIC CALENDAR <span class="view-all">View All</span></h3>
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-          <span style="background:#3a1414;color:var(--red);font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:5px;">High Impact</span>
-          <span style="color:var(--gold);">★★★★★</span>
+          <span style="background:#3a1414;color:var(--red);font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:5px;" id="econImpactPill">High Impact</span>
+          <span style="color:var(--gold);" id="econStars">★★★★★</span>
         </div>
-        <div style="font-size:12px;font-weight:700;" id="econTime">19:30 WIB — Retail Sales (MoM)</div>
+        <div style="font-size:12px;font-weight:700;" id="econTime">Memuat kalender ekonomi…</div>
         <div style="display:flex;gap:20px;margin-top:8px;font-size:11.5px;">
-          <div><div style="color:var(--muted);">Forecast</div><b>0.3%</b></div>
-          <div><div style="color:var(--muted);">Previous</div><b>0.1%</b></div>
-          <div><div style="color:var(--muted);">Impact</div><b style="color:var(--red);">HIGH</b></div>
+          <div><div style="color:var(--muted);">Forecast</div><b id="econForecast">—</b></div>
+          <div><div style="color:var(--muted);">Previous</div><b id="econPrevious">—</b></div>
+          <div><div style="color:var(--muted);">Impact</div><b style="color:var(--red);" id="econImpactLabel">—</b></div>
         </div>
         <div style="margin-top:10px;background:#241c0e;border:1px solid #4a3714;border-radius:8px;padding:8px 10px;font-size:11px;color:var(--amber);">⚠ Avoid opening position 30 minutes before news.</div>
       </div>
@@ -399,6 +399,9 @@ const CONFIG = {
   twelvedata:   '5f52a74cd9f24b49a4729b5b8e599505',
   alphavantage: 'WHG8LN30E6PZQ7XQ',
   fred:         '64241723f5d8a75e65d3b2cac00bef32',
+  finnhub:      'd91knkpr01qqfqkcnrngd91knkpr01qqfqkcnro0',
+  tiingo:       'cde989612418630888ff75cc05739f4a8014e4ea',
+  eodhd:        '6a5a19149fda53.98765525',
 };
 const LIVE = { connected:false, fred:false, candles:false };
 function updateLiveBadge(){
@@ -427,6 +430,10 @@ const STORE = {
   correlations: {'DXY':-0.94,'Silver':0.89,'US10Y':-0.88,'Oil':0.35,'SP500':-0.76},
   candles: [],
   alerts: [],
+  econEvent: {
+    name: 'Retail Sales (MoM)', time: new Date(new Date().setHours(19,30,0,0)),
+    forecast: '0.3%', previous: '0.1%', impactNum: 3, impact: 'HIGH',
+  },
 };
 
 // seed price history & candles
@@ -471,7 +478,14 @@ async function fetchRawData(){
       const d2 = await res2.json();
       const rate = d2['Realtime Currency Exchange Rate'] && parseFloat(d2['Realtime Currency Exchange Rate']['5. Exchange Rate']);
       if (rate){ raw.XAUUSD = {price: rate, chg: STORE.prices.XAUUSD.chg}; liveOK = true; }
-    }catch(e){ /* also failed — will simulate below */ }
+    }catch(e){ /* also failed — try EODHD next */ }
+  }
+  if (!raw.XAUUSD){
+    try{
+      const res3 = await fetch(`https://eodhd.com/api/real-time/XAUUSD.FOREX?api_token=${CONFIG.eodhd}&fmt=json`);
+      const d3 = await res3.json();
+      if (d3 && d3.close){ raw.XAUUSD = {price: parseFloat(d3.close), chg: parseFloat(d3.change_p||0)}; liveOK = true; }
+    }catch(e){ /* all three failed — will simulate below */ }
   }
 
   // anything still missing gets a small simulated jitter off the last known real price
@@ -528,6 +542,65 @@ async function fetchCandles(){
     }
   }catch(e){ LIVE.candles = false; }
   render();
+}
+
+// ---------- Latest News (Tiingo News API) ----------
+async function fetchNews(){
+  try{
+    const res = await fetch(`https://api.tiingo.com/tiingo/news?tags=gold,federal-reserve,dollar,inflation,interest-rates&token=${CONFIG.tiingo}&limit=6`);
+    const data = await res.json();
+    if (Array.isArray(data) && data.length){
+      STORE.news = data.map(a=>({
+        src: (a.source || 'News').replace(/\.(com|net|org)$/i,'').split(/[\s.]/)[0],
+        text: a.title,
+        publishedAt: new Date(a.publishedDate || a.crawlDate).getTime(),
+      }));
+      LIVE.news = true;
+    }
+  }catch(e){ LIVE.news = false; /* keeps last known / seed news */ }
+  render();
+}
+
+// ---------- Economic Calendar (Finnhub) ----------
+async function fetchEconomicCalendar(){
+  try{
+    const res = await fetch(`https://finnhub.io/api/v1/calendar/economic?token=${CONFIG.finnhub}`);
+    const data = await res.json();
+    const now = Date.now();
+    const events = (data.economicCalendar || [])
+      .filter(e => e.country === 'US')
+      .map(e => ({...e, ts: new Date(e.time).getTime()}))
+      .filter(e => !isNaN(e.ts))
+      .sort((a,b) => a.ts - b.ts);
+    const upcoming = events.filter(e => e.ts >= now);
+    const pick = upcoming.find(e => Number(e.impact) >= 2) || upcoming[0] || events[events.length-1];
+    if (pick){
+      const impactNum = Number(pick.impact) || 1;
+      STORE.econEvent = {
+        name: pick.event,
+        time: new Date(pick.ts),
+        forecast: pick.estimate,
+        previous: pick.prev,
+        impactNum,
+        impact: impactNum >= 3 ? 'HIGH' : impactNum === 2 ? 'MEDIUM' : 'LOW',
+      };
+      LIVE.econCal = true;
+    }
+  }catch(e){ LIVE.econCal = false; /* keeps the seed event card */ }
+  renderEconomicCalendar();
+}
+function renderEconomicCalendar(){
+  const ev = STORE.econEvent;
+  if (!ev) return;
+  const timeStr = ev.time.toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'}) + ' WIB';
+  document.getElementById('econTime').textContent = `${timeStr} — ${ev.name}`;
+  document.getElementById('econForecast').textContent = ev.forecast ?? '—';
+  document.getElementById('econPrevious').textContent = ev.previous ?? '—';
+  document.getElementById('econImpactLabel').textContent = ev.impact;
+  document.getElementById('econImpactPill').textContent = ev.impact === 'HIGH' ? 'High Impact' : ev.impact === 'MEDIUM' ? 'Medium Impact' : 'Low Impact';
+  document.getElementById('econImpactPill').style.color = ev.impact==='HIGH' ? 'var(--red)' : ev.impact==='MEDIUM' ? 'var(--amber)' : 'var(--green)';
+  document.getElementById('econImpactPill').style.background = ev.impact==='HIGH' ? '#3a1414' : ev.impact==='MEDIUM' ? '#241c0e' : '#123321';
+  document.getElementById('econStars').textContent = '★'.repeat(ev.impactNum || 3) + '☆'.repeat(5-(ev.impactNum || 3));
 }
 
 // ---------- 4. PROCESS: Market Intelligence Engine ----------
@@ -694,15 +767,21 @@ function renderSessions(sessions){
 function flagFor(n){ return {'Sydney':'🇦🇺','Tokyo':'🇯🇵','London':'🇬🇧','New York':'🇺🇸'}[n]||''; }
 
 function renderNews(){
-  let html = STORE.news.map(n=>`
+  const isLive = !!(STORE.news[0] && STORE.news[0].publishedAt);
+  let html = STORE.news.map(n=>{
+    const mins = isLive ? Math.max(0, Math.round((Date.now()-n.publishedAt)/60000)) : n.min;
+    return `
     <div class="news-item">
-      <div class="src">${n.src[0]}</div>
+      <div class="src">${(n.src||'?')[0]}</div>
       <div style="flex:1;">${n.text}</div>
-      <div class="time">${n.min}m ago</div>
-    </div>`).join('');
+      <div class="time">${mins}m ago</div>
+    </div>`;
+  }).join('');
   document.getElementById('newsList').innerHTML = html;
-  // age the news slightly each tick
-  STORE.news.forEach(n=> n.min += Math.random()<0.3?1:0);
+  if (!isLive){
+    // age the seed/mock news slightly each tick until live data arrives
+    STORE.news.forEach(n=> n.min += Math.random()<0.3?1:0);
+  }
 }
 
 function renderHeatmap(scores){
@@ -915,13 +994,18 @@ document.querySelectorAll('.nav-item').forEach(item=>{
 
 // ---------- Boot ----------
 clock();
+renderEconomicCalendar();
 tick();
 fetchUS10Y();
 fetchCandles();
+fetchNews();
+fetchEconomicCalendar();
 setInterval(clock, 1000);
-setInterval(tick, 20000);        // TwelveData quote (4 symbols/call) — well under free 8 req/min limit
+setInterval(tick, 20000);           // TwelveData quote (4 symbols/call) — well under free 8 req/min limit
 setInterval(fetchUS10Y, 5*60*1000); // FRED is daily data, no need to hammer it
 setInterval(fetchCandles, 60000);   // hourly candles, refresh every minute
+setInterval(fetchNews, 5*60*1000);  // news doesn't need second-by-second polling
+setInterval(fetchEconomicCalendar, 30*60*1000); // calendar rarely changes intraday
 runAILayer(false);
 setTimeout(()=>{ document.getElementById('bootLoader').style.display='none'; }, 600);
 </script>
