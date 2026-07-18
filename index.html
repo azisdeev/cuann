@@ -403,12 +403,12 @@ const CONFIG = {
   tiingo:       'cde989612418630888ff75cc05739f4a8014e4ea',
   eodhd:        '6a5a19149fda53.98765525',
 };
-const LIVE = { connected:false, fred:false, candles:false };
+const LIVE = { connected:false, source:'', fred:false, candles:false };
 function updateLiveBadge(){
   const el = document.getElementById('liveBadge');
   if (!el) return;
-  if (LIVE.connected){ el.textContent='🟢 Live Data (TwelveData)'; el.style.color='var(--green)'; el.style.background='#123321'; }
-  else { el.textContent='🟡 Simulated (API unreachable)'; el.style.color='var(--amber)'; el.style.background='#241c0e'; }
+  if (LIVE.connected){ el.textContent=`🟢 Live Data (${LIVE.source})`; el.style.color='var(--green)'; el.style.background='#123321'; }
+  else { el.textContent='🟡 Simulated (all APIs unreachable)'; el.style.color='var(--amber)'; el.style.background='#241c0e'; }
 }
 
 // ---------- 3. STORE (simulated Postgres + Redis cache) ----------
@@ -453,39 +453,70 @@ const STORE = {
   }
 })();
 
-// ---------- 1. FETCH DATA (live feed: TwelveData primary, Alpha Vantage fallback for Gold) ----------
+// ---------- 1. FETCH DATA ----------
+// PRIMARY: EODHD (all 4 symbols in one batched real-time call)
+// FALLBACK: TwelveData, auto-engaged whenever EODHD errors out or hits its rate limit.
+// A cooldown keeps retrying EODHD from hammering an already-limited key every 20s;
+// it's re-tried automatically after the cooldown window passes.
+const EODHD_SYMBOLS = { XAUUSD:'XAUUSD.FOREX', DXY:'DXY.INDX', VIX:'VIX.INDX', OIL:'WTI.COMM' };
+let eodhdCooldownUntil = 0;
+
 async function fetchRawData(){
   const raw = {};
   let liveOK = false;
-  try{
-    const symbols = 'XAU/USD,DXY,VIX,WTI/USD';
-    const res = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols)}&apikey=${CONFIG.twelvedata}`);
-    const data = await res.json();
-    const map = {'XAU/USD':'XAUUSD','DXY':'DXY','VIX':'VIX','WTI/USD':'OIL'};
-    for (const sym in map){
-      const d = data[sym];
-      if (d && d.close && !d.code){
-        raw[map[sym]] = {price: parseFloat(d.close), chg: parseFloat(d.percent_change || 0)};
-        liveOK = true;
-      }
-    }
-  }catch(e){ /* network/CORS issue — fall through to fallback + simulation below */ }
+  const srcUsed = {}; // symbol -> 'eodhd' | 'twelvedata' | 'alphavantage'
 
-  // fallback for Gold specifically if TwelveData didn't return it
+  // ---- PRIMARY: EODHD ----
+  if (Date.now() > eodhdCooldownUntil){
+    try{
+      const s = `${EODHD_SYMBOLS.DXY},${EODHD_SYMBOLS.VIX},${EODHD_SYMBOLS.OIL}`;
+      const res = await fetch(`https://eodhd.com/api/real-time/${EODHD_SYMBOLS.XAUUSD}?s=${s}&api_token=${CONFIG.eodhd}&fmt=json`);
+      if (res.status === 429 || res.status === 402){
+        eodhdCooldownUntil = Date.now() + 10*60*1000; // rate-limited — back off 10 min, use TwelveData meanwhile
+      } else {
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : [data];
+        const reverse = { [EODHD_SYMBOLS.XAUUSD]:'XAUUSD', [EODHD_SYMBOLS.DXY]:'DXY', [EODHD_SYMBOLS.VIX]:'VIX', [EODHD_SYMBOLS.OIL]:'OIL' };
+        list.forEach(item=>{
+          const code = item.code || EODHD_SYMBOLS.XAUUSD; // single-symbol reply may omit "code"
+          const key = reverse[code];
+          if (key && typeof item.close === 'number' && !isNaN(item.close)){
+            raw[key] = {price: item.close, chg: parseFloat(item.change_p) || 0};
+            srcUsed[key] = 'eodhd';
+            liveOK = true;
+          }
+        });
+      }
+    }catch(e){ eodhdCooldownUntil = Date.now() + 2*60*1000; /* network/CORS hiccup — short cooldown, retry soon */ }
+  }
+
+  // ---- FALLBACK: TwelveData for whatever EODHD didn't cover ----
+  const missing = ['XAUUSD','DXY','VIX','OIL'].filter(k=>!raw[k]);
+  if (missing.length){
+    try{
+      const symMap = {XAUUSD:'XAU/USD', DXY:'DXY', VIX:'VIX', OIL:'WTI/USD'};
+      const symbols = missing.map(k=>symMap[k]).join(',');
+      const res = await fetch(`https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols)}&apikey=${CONFIG.twelvedata}`);
+      const data = await res.json();
+      missing.forEach(k=>{
+        const d = missing.length===1 ? data : data[symMap[k]];
+        if (d && d.close && !d.code){
+          raw[k] = {price: parseFloat(d.close), chg: parseFloat(d.percent_change || 0)};
+          srcUsed[k] = 'twelvedata';
+          liveOK = true;
+        }
+      });
+    }catch(e){ /* network/CORS issue — remaining gaps get simulated below */ }
+  }
+
+  // ---- Last resort for Gold only: Alpha Vantage, then simulation ----
   if (!raw.XAUUSD){
     try{
       const res2 = await fetch(`https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=XAU&to_currency=USD&apikey=${CONFIG.alphavantage}`);
       const d2 = await res2.json();
       const rate = d2['Realtime Currency Exchange Rate'] && parseFloat(d2['Realtime Currency Exchange Rate']['5. Exchange Rate']);
-      if (rate){ raw.XAUUSD = {price: rate, chg: STORE.prices.XAUUSD.chg}; liveOK = true; }
-    }catch(e){ /* also failed — try EODHD next */ }
-  }
-  if (!raw.XAUUSD){
-    try{
-      const res3 = await fetch(`https://eodhd.com/api/real-time/XAUUSD.FOREX?api_token=${CONFIG.eodhd}&fmt=json`);
-      const d3 = await res3.json();
-      if (d3 && d3.close){ raw.XAUUSD = {price: parseFloat(d3.close), chg: parseFloat(d3.change_p||0)}; liveOK = true; }
-    }catch(e){ /* all three failed — will simulate below */ }
+      if (rate){ raw.XAUUSD = {price: rate, chg: STORE.prices.XAUUSD.chg}; srcUsed.XAUUSD='alphavantage'; liveOK = true; }
+    }catch(e){ /* all sources failed — will simulate below */ }
   }
 
   // anything still missing gets a small simulated jitter off the last known real price
@@ -498,6 +529,11 @@ async function fetchRawData(){
   raw.US10Y = {price: STORE.prices.US10Y.price, chg: STORE.prices.US10Y.chg}; // updated separately via FRED
   raw.fearGreed = STORE.fearGreed + (Math.random()-0.5)*3;
   LIVE.connected = liveOK;
+  const sources = Object.values(srcUsed);
+  LIVE.source = sources.includes('eodhd') ? 'EODHD'
+    : sources.includes('twelvedata') ? 'TwelveData'
+    : sources.includes('alphavantage') ? 'Alpha Vantage'
+    : '';
   updateLiveBadge();
   return raw;
 }
