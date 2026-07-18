@@ -407,8 +407,15 @@ const LIVE = { connected:false, source:'', fred:false, candles:false };
 function updateLiveBadge(){
   const el = document.getElementById('liveBadge');
   if (!el) return;
-  if (LIVE.connected){ el.textContent=`🟢 Live Data (${LIVE.source})`; el.style.color='var(--green)'; el.style.background='#123321'; }
-  else { el.textContent='🟡 Simulated (all APIs unreachable)'; el.style.color='var(--amber)'; el.style.background='#241c0e'; }
+  if (LIVE.connected){
+    el.textContent = `🟢 Live Data (${LIVE.source})`;
+    el.style.color = 'var(--green)'; el.style.background = '#123321';
+    el.title = '';
+  } else {
+    el.textContent = '🟡 Simulated (all APIs unreachable)';
+    el.style.color = 'var(--amber)'; el.style.background = '#241c0e';
+    el.title = 'Buka DevTools (F12) → tab Console untuk lihat pesan error asli dari tiap API (biasanya CORS).';
+  }
 }
 
 // ---------- 3. STORE (simulated Postgres + Redis cache) ----------
@@ -487,7 +494,7 @@ async function fetchRawData(){
           }
         });
       }
-    }catch(e){ eodhdCooldownUntil = Date.now() + 2*60*1000; /* network/CORS hiccup — short cooldown, retry soon */ }
+    }catch(e){ eodhdCooldownUntil = Date.now() + 2*60*1000; console.warn('[EODHD] fetch failed (likely CORS or network):', e); }
   }
 
   // ---- FALLBACK: TwelveData for whatever EODHD didn't cover ----
@@ -506,7 +513,7 @@ async function fetchRawData(){
           liveOK = true;
         }
       });
-    }catch(e){ /* network/CORS issue — remaining gaps get simulated below */ }
+    }catch(e){ console.warn('[TwelveData] fetch failed (likely CORS or network):', e); }
   }
 
   // ---- Last resort for Gold only: Alpha Vantage, then simulation ----
@@ -516,7 +523,7 @@ async function fetchRawData(){
       const d2 = await res2.json();
       const rate = d2['Realtime Currency Exchange Rate'] && parseFloat(d2['Realtime Currency Exchange Rate']['5. Exchange Rate']);
       if (rate){ raw.XAUUSD = {price: rate, chg: STORE.prices.XAUUSD.chg}; srcUsed.XAUUSD='alphavantage'; liveOK = true; }
-    }catch(e){ /* all sources failed — will simulate below */ }
+    }catch(e){ console.warn('[AlphaVantage] fetch failed (likely CORS or network):', e); }
   }
 
   // anything still missing gets a small simulated jitter off the last known real price
@@ -562,7 +569,7 @@ async function fetchUS10Y(){
       STORE.prices.US10Y.hist.push(latest); if (STORE.prices.US10Y.hist.length>30) STORE.prices.US10Y.hist.shift();
       LIVE.fred = true;
     }
-  }catch(e){ LIVE.fred = false; /* stays on last known / simulated value */ }
+  }catch(e){ LIVE.fred = false; console.warn('[FRED] fetch failed (likely CORS — expected for gov APIs from browser):', e); }
   render();
 }
 
@@ -576,7 +583,7 @@ async function fetchCandles(){
       STORE.candles = vals.map(v=>({open:parseFloat(v.open),close:parseFloat(v.close),high:parseFloat(v.high),low:parseFloat(v.low)}));
       LIVE.candles = true;
     }
-  }catch(e){ LIVE.candles = false; }
+  }catch(e){ LIVE.candles = false; console.warn('[TwelveData candles] fetch failed:', e); }
   render();
 }
 
@@ -593,7 +600,7 @@ async function fetchNews(){
       }));
       LIVE.news = true;
     }
-  }catch(e){ LIVE.news = false; /* keeps last known / seed news */ }
+  }catch(e){ LIVE.news = false; console.warn('[Tiingo news] fetch failed (likely CORS or network):', e); }
   render();
 }
 
@@ -622,7 +629,7 @@ async function fetchEconomicCalendar(){
       };
       LIVE.econCal = true;
     }
-  }catch(e){ LIVE.econCal = false; /* keeps the seed event card */ }
+  }catch(e){ LIVE.econCal = false; console.warn('[Finnhub calendar] fetch failed (likely CORS or network):', e); }
   renderEconomicCalendar();
 }
 function renderEconomicCalendar(){
